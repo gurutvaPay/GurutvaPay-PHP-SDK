@@ -1,252 +1,210 @@
 <?php
-/**
- * GuruTvapay PHP SDK - single-file client (gurutvapay_client.php)
- *
- * Usage:
- * 1. Save this file as `gurutvapay_client.php` and include it in your project:
- *
- *    require_once 'gurutvapay_client.php';
- *
- * 2. Instantiate in API-key mode:
- *
- *    $client = new GuruTvapay\GuruTvapayClient(['env' => 'uat', 'apiKey' => 'sk_test_...']);
- *    $resp = $client->createPayment(100, 'ORD123', 'web', 'Online Payment', [
- *      'buyer_name' => 'John', 'email' => 'john@example.com', 'phone' => '9876543210'
- *    ]);
- *    echo $resp['payment_url'];
- *
- * 3. OAuth (password grant) mode:
- *
- *    $client = new GuruTvapay\GuruTvapayClient(['env'=>'uat','clientId'=>'CLIENT_123','clientSecret'=>'SECRET_456']);
- *    $tokenInfo = $client->loginWithPassword('john@example.com','password');
- *
- * Notes:
- * - This SDK uses curl (no external deps) and provides simple retry/backoff for network/server errors.
- * - For idempotency headers, use the request() method to pass custom headers.
- */
+class GurutvaPayException extends Exception {}
 
-namespace GuruTvapay;
+class GurutvaPay {
+    private $mode; // 'uat' or 'live'
+    private $baseUrl;
+    private $config;
+    private $cacheFile; // path for token cache
+    private $expiryBuffer = 300; // seconds before expiry when we proactively refresh (5 minutes)
 
-class GuruTvapayException extends \Exception {}
-class AuthException extends GuruTvapayException {}
-class NotFoundException extends GuruTvapayException {}
-class RateLimitException extends GuruTvapayException {}
-
-class GuruTvapayClient {
-    private $env;
-    private $apiKey;
-    private $clientId;
-    private $clientSecret;
-    private $timeout;
-    private $maxRetries;
-    private $backoffFactor;
-    private $root;
-    private $token; // ['access_token'=>..., 'expires_at'=>int]
-
-    const DEFAULT_ROOT = 'https://api.gurutvapay.com';
-    private static $envPrefixes = [
-        'uat' => '/uat_mode',
-        'live' => '/live',
-    ];
-
-    public function __construct(array $opts = []) {
-        $this->env = isset($opts['env']) ? $opts['env'] : 'uat';
-        if (!isset(self::$envPrefixes[$this->env])) {
-            throw new \InvalidArgumentException("env must be 'uat' or 'live'");
+    /**
+     * $mode: 'uat' or 'live'
+     * $config: [
+     *   'client_id' => '',
+     *   'client_secret' => '',
+     *   'username' => '',
+     *   'password' => '',
+     *   // optional:
+     *   'token_cache_file' => '/path/to/cache.json'
+     * ]
+     */
+    public function __construct(string $mode, array $config = []) {
+        $mode = strtolower($mode);
+        if (!in_array($mode, ['uat', 'live'])) {
+            throw new GurutvaPayException("Mode must be 'uat' or 'live'");
         }
-        $this->apiKey = $opts['apiKey'] ?? null;
-        $this->clientId = $opts['clientId'] ?? null;
-        $this->clientSecret = $opts['clientSecret'] ?? null;
-        $this->timeout = $opts['timeout'] ?? 30;
-        $this->maxRetries = $opts['maxRetries'] ?? 3;
-        $this->backoffFactor = $opts['backoffFactor'] ?? 0.5;
-        $this->root = $opts['customRoot'] ?? self::DEFAULT_ROOT;
-        $this->token = null;
+        $this->mode = $mode;
+        $this->config = $config;
+        $this->baseUrl = 'https://api.gurutvapay.com/' . ($mode === 'uat' ? 'uat_mode' : 'live');
+
+        // cache file default (make sure web server user can write)
+        $this->cacheFile = $config['token_cache_file'] ?? sys_get_temp_dir() . "/gurutvapay_{$mode}_token.json";
     }
 
-    // -----------------------------
-    // Low-level request helper with retries
-    // -----------------------------
-    private function httpRequest($method, $url, $headers = [], $params = [], $data = null, $jsonBody = null) {
-        $attempt = 0;
-        while (true) {
-            $attempt += 1;
-            $ch = curl_init();
-            $finalUrl = $url;
-            if (!empty($params)) {
-                $finalUrl .= '?' . http_build_query($params);
+    /**
+     * Returns a valid access token (string).
+     * Will use cached token if present & not expiring within expiryBuffer seconds.
+     * Otherwise logs in and caches the token.
+     */
+    public function getAccessToken(): string {
+        // Try to load from cache
+        $cached = $this->loadTokenFromFile();
+
+        if ($cached && isset($cached['access_token']) && isset($cached['expires_at'])) {
+            $now = time();
+            $expiresAt = (int)$cached['expires_at'];
+
+            // if it's still valid with buffer, return it
+            if ($expiresAt - $now > $this->expiryBuffer) {
+                return $cached['access_token'];
             }
-            curl_setopt($ch, CURLOPT_URL, $finalUrl);
-            curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-            curl_setopt($ch, CURLOPT_TIMEOUT, $this->timeout);
-            curl_setopt($ch, CURLOPT_FAILONERROR, false);
+            // otherwise fall through to refresh
+        }
 
-            $hdrs = [];
-            foreach ($headers as $k => $v) {
-                $hdrs[] = $k . ': ' . $v;
+        // perform login and cache the result
+        $loginResp = $this->login();
+        if (!isset($loginResp['access_token'])) {
+            throw new GurutvaPayException("Login didn't return access_token");
+        }
+
+        // compute expires_at (prefer returned expires_at or expires_at_iso)
+        $expiresAt = null;
+        if (isset($loginResp['expires_at']) && is_numeric($loginResp['expires_at'])) {
+            $expiresAt = (int)$loginResp['expires_at'];
+        } elseif (isset($loginResp['expires_at_iso'])) {
+            $ts = strtotime($loginResp['expires_at_iso']);
+            if ($ts !== false) $expiresAt = $ts;
+        } elseif (isset($loginResp['expires_in'])) {
+            $expiresAt = time() + (int)$loginResp['expires_in'];
+        } else {
+            // fallback: short expiry so we force refresh next time
+            $expiresAt = time() + 300;
+        }
+
+        $this->saveTokenToFile([
+            'access_token' => $loginResp['access_token'],
+            'expires_at' => $expiresAt
+        ]);
+
+        return $loginResp['access_token'];
+    }
+
+    /**
+     * Login (password grant) — returns API JSON array (decoded).
+     */
+    public function login(): array {
+        $url = $this->baseUrl . '/login';
+        $body = [
+            'grant_type' => 'password',
+            'username' => $this->config['username'] ?? '',
+            'password' => $this->config['password'] ?? '',
+            'client_id' => $this->config['client_id'] ?? '',
+            'client_secret' => $this->config['client_secret'] ?? ''
+        ];
+        foreach (['username','password','client_id','client_secret'] as $k) {
+            if (empty($body[$k])) {
+                throw new GurutvaPayException("Missing required login config: {$k}");
             }
-            // add auth header if available
-            $auth = $this->authHeader();
-            foreach ($auth as $k => $v) { $hdrs[] = $k . ': ' . $v; }
+        }
+        $headers = ["Content-Type: application/x-www-form-urlencoded"];
+        $resp = $this->httpPost($url, http_build_query($body), $headers);
+        if (!is_array($resp)) throw new GurutvaPayException("Invalid JSON response from login");
+        return $resp;
+    }
 
-            if (!empty($jsonBody)) {
-                $body = json_encode($jsonBody);
-                $hdrs[] = 'Content-Type: application/json';
-                curl_setopt($ch, CURLOPT_POSTFIELDS, $body);
-            } elseif (is_array($data)) {
-                // form-encoded
-                $hdrs[] = 'Content-Type: application/x-www-form-urlencoded';
-                curl_setopt($ch, CURLOPT_POSTFIELDS, http_build_query($data));
-            }
+    /**
+     * Initiate payment: $payload and token obtained through getAccessToken()
+     */
+    public function initiatePayment(array $payload, ?string $accessToken = null): array {
+        $accessToken = $accessToken ?? $this->getAccessToken();
+        $url = $this->baseUrl . '/initiate-payment';
+        $headers = [
+            "Content-Type: application/json",
+            "Authorization: Bearer " . $accessToken
+        ];
+        $json = json_encode($payload, JSON_UNESCAPED_UNICODE);
+        if ($json === false) throw new GurutvaPayException("Failed to encode payload to JSON");
+        $resp = $this->httpPost($url, $json, $headers);
+        if (!is_array($resp)) throw new GurutvaPayException("Invalid JSON response from initiate-payment");
+        return $resp;
+    }
 
-            if (strtoupper($method) === 'POST') {
-                curl_setopt($ch, CURLOPT_POST, true);
-            } else {
-                curl_setopt($ch, CURLOPT_CUSTOMREQUEST, strtoupper($method));
-            }
+    /*****************************
+     * Token file cache helpers
+     *****************************/
+    private function loadTokenFromFile(): ?array {
+        $file = $this->cacheFile;
+        if (!file_exists($file)) return null;
 
-            if (!empty($hdrs)) curl_setopt($ch, CURLOPT_HTTPHEADER, $hdrs);
+        $fp = fopen($file, 'r');
+        if (!$fp) return null;
+        // shared lock
+        if (!flock($fp, LOCK_SH)) {
+            fclose($fp);
+            return null;
+        }
+        $contents = stream_get_contents($fp);
+        flock($fp, LOCK_UN);
+        fclose($fp);
 
-            $respBody = curl_exec($ch);
-            $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-            $curlErr = curl_error($ch);
+        if (empty($contents)) return null;
+        $data = json_decode($contents, true);
+        if (!is_array($data)) return null;
+        return $data;
+    }
+
+    private function saveTokenToFile(array $data): void {
+        $file = $this->cacheFile;
+        $dir = dirname($file);
+        if (!is_dir($dir)) {
+            @mkdir($dir, 0755, true);
+        }
+        $tmp = $file . '.tmp';
+        $fp = fopen($tmp, 'c');
+        if (!$fp) {
+            throw new GurutvaPayException("Unable to open temp file for token cache");
+        }
+        // exclusive lock
+        if (!flock($fp, LOCK_EX)) {
+            fclose($fp);
+            throw new GurutvaPayException("Unable to lock token cache file");
+        }
+        // write
+        ftruncate($fp, 0);
+        rewind($fp);
+        fwrite($fp, json_encode($data, JSON_UNESCAPED_UNICODE));
+        fflush($fp);
+        flock($fp, LOCK_UN);
+        fclose($fp);
+        // atomic replace
+        rename($tmp, $file);
+    }
+
+    /*****************************
+     * HTTP helper
+     *****************************/
+    private function httpPost(string $url, string $body, array $headers = []): array {
+        $ch = curl_init($url);
+        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+        curl_setopt($ch, CURLOPT_POST, true);
+        curl_setopt($ch, CURLOPT_POSTFIELDS, $body);
+        curl_setopt($ch, CURLOPT_HTTPHEADER, $headers);
+        curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 10);
+        curl_setopt($ch, CURLOPT_TIMEOUT, 30);
+
+        $raw = curl_exec($ch);
+        if ($raw === false) {
+            $err = curl_error($ch);
             curl_close($ch);
+            throw new GurutvaPayException("cURL error: {$err}");
+        }
+        $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        curl_close($ch);
+        $decoded = json_decode($raw, true);
 
-            if ($curlErr) {
-                if ($attempt > $this->maxRetries) {
-                    throw new GuruTvapayException("HTTP request failed: {$curlErr}");
-                }
-                $sleep = $this->backoffFactor * pow(2, $attempt - 1);
-                usleep((int)($sleep * 1e6));
-                continue;
+        if ($httpCode >= 200 && $httpCode < 300) {
+            if ($decoded === null && json_last_error() !== JSON_ERROR_NONE) {
+                throw new GurutvaPayException("Received non-JSON 2xx response: {$raw}");
             }
-
-            $decoded = json_decode($respBody, true);
-
-            if ($httpCode >= 200 && $httpCode < 300) {
-                return $decoded ?? ['raw' => $respBody];
-            }
-
-            if ($httpCode == 401 || $httpCode == 403) {
-                throw new AuthException("Authentication failed: {$respBody}");
-            }
-            if ($httpCode == 404) {
-                throw new NotFoundException("Not found: {$url}");
-            }
-            if ($httpCode == 429) {
-                if ($attempt <= $this->maxRetries) {
-                    $retryAfter = null; // curl doesn't expose headers easily here; skip
-                    $sleep = $this->backoffFactor * pow(2, $attempt - 1);
-                    usleep((int)($sleep * 1e6));
-                    continue;
-                }
-                throw new RateLimitException("Rate limited: {$respBody}");
-            }
-
-            if ($httpCode >= 500 && $attempt <= $this->maxRetries) {
-                $sleep = $this->backoffFactor * pow(2, $attempt - 1);
-                usleep((int)($sleep * 1e6));
-                continue;
-            }
-
-            throw new GuruTvapayException("HTTP {$httpCode}: {$respBody}");
+            return (array)$decoded;
         }
-    }
-
-    // -----------------------------
-    // Auth helpers
-    // -----------------------------
-    private function authHeader() {
-        if ($this->apiKey) {
-            return ['Authorization' => 'Bearer ' . $this->apiKey];
+        $message = "HTTP {$httpCode}";
+        if ($decoded !== null) {
+            $message .= " - " . json_encode($decoded);
+        } else {
+            $message .= " - " . substr($raw, 0, 500);
         }
-        if ($this->token && isset($this->token['access_token']) && !$this->isTokenExpired()) {
-            return ['Authorization' => 'Bearer ' . $this->token['access_token']];
-        }
-        return [];
-    }
-
-    private function isTokenExpired() {
-        if (!$this->token || !isset($this->token['expires_at'])) return true;
-        return time() >= ($this->token['expires_at'] - 10);
-    }
-
-    public function loginWithPassword($username, $password, $grantType = 'password') {
-        if (!$this->clientId || !$this->clientSecret) {
-            throw new \InvalidArgumentException('clientId and clientSecret are required for OAuth login');
-        }
-        $url = $this->root . self::$envPrefixes[$this->env] . '/login';
-        $data = [
-            'grant_type' => $grantType,
-            'username' => $username,
-            'password' => $password,
-            'client_id' => $this->clientId,
-            'client_secret' => $this->clientSecret,
-        ];
-        $resp = $this->httpRequest('POST', $url, [], [], $data, null);
-        if (!isset($resp['access_token'])) {
-            throw new AuthException('Login failed or missing access_token');
-        }
-        $expiresAt = isset($resp['expires_at']) ? intval($resp['expires_at']) : (time() + intval($resp['expires_in'] ?? 0));
-        $this->token = ['access_token' => $resp['access_token'], 'expires_at' => $expiresAt];
-        return $this->token;
-    }
-
-    // -----------------------------
-    // High-level methods
-    // -----------------------------
-    public function createPayment($amount, $merchantOrderId, $channel, $purpose, array $customer, $expiresIn = null, $metadata = null) {
-        $url = self::DEFAULT_ROOT . '/initiate-payment';
-        $payload = [
-            'amount' => $amount,
-            'merchantOrderId' => $merchantOrderId,
-            'channel' => $channel,
-            'purpose' => $purpose,
-            'customer' => $customer,
-        ];
-        if ($expiresIn !== null) $payload['expires_in'] = $expiresIn;
-        if ($metadata !== null) $payload['metadata'] = $metadata;
-        return $this->httpRequest('POST', $url, [], [], null, $payload);
-    }
-
-    public function transactionStatus($merchantOrderId) {
-        $url = $this->root . self::$envPrefixes[$this->env] . '/transaction-status';
-        $data = ['merchantOrderId' => $merchantOrderId];
-        return $this->httpRequest('POST', $url, [], [], $data, null);
-    }
-
-    public function transactionList($limit = 50, $page = 0) {
-        $url = $this->root . self::$envPrefixes[$this->env] . '/transaction-list';
-        $params = ['limit' => $limit, 'page' => $page];
-        return $this->httpRequest('GET', $url, [], $params, null, null);
-    }
-
-    // Generic request for advanced use (headers passed here will be merged with auth)
-    public function request($method, $pathOrUrl, $headers = [], $params = [], $data = null, $jsonBody = null) {
-        $url = $pathOrUrl;
-        if (strpos($pathOrUrl, 'http://') !== 0 && strpos($pathOrUrl, 'https://') !== 0) {
-            // join root
-            if (strpos($pathOrUrl, '/') !== 0) $pathOrUrl = '/' . $pathOrUrl;
-            $url = $this->root . $pathOrUrl;
-        }
-        return $this->httpRequest($method, $url, $headers, $params, $data, $jsonBody);
-    }
-
-    // -----------------------------
-    // Webhook verification
-    // -----------------------------
-    public static function verifyWebhook($payloadBytes, $signatureHeader, $secret) {
-        $sig = $signatureHeader;
-        if (strpos($sig, 'sha256=') === 0) {
-            $sig = substr($sig, 7);
-        }
-        $computed = hash_hmac('sha256', $payloadBytes, $secret);
-        // timing-safe compare
-        if (function_exists('hash_equals')) {
-            return hash_equals($computed, $sig);
-        }
-        return $computed === $sig;
+        throw new GurutvaPayException($message);
     }
 }
-
-// End of file
