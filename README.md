@@ -1,74 +1,69 @@
-Single-file PHP SDK + client-side checkout launcher integration for Gurutvapay.
-This repository contains:
+# GurutvaPay PHP SDK + Client-Side Checkout Launcher
 
-gurutvapay_client.php — a tiny, single-file PHP SDK that:
+Single-file PHP SDK + client-side checkout launcher integration for **GurutvaPay**.
 
-logs in via OAuth password grant (/uat_mode/login or /live/login);
+---
 
-initiates payments (/uat_mode/initiate-payment or /live/initiate-payment);
+## Repository Contents
 
-returns the gateway token and payment_url you need to open the checkout.
+- **`gurutvapay_client.php`** — tiny, single-file PHP SDK:
+  - Logs in via OAuth password grant (`/uat_mode/login` or `/live/login`)
+  - Initiates payments (`/uat_mode/initiate-payment` or `/live/initiate-payment`)
+  - Returns the gateway `token` and `payment_url` to open checkout
 
-Two thin checkout launcher scripts you can host (or use from the gateway):
+- **Checkout launcher scripts**:
+  - `gurutvapay-uat.js` → opens `https://uat-pay.gurutvapay.com/payment?token=...`
+  - `gurutvapay-live.js` → opens `https://payment.gurutvapay.com/payment?token=...`
 
-gurutvapay-uat.js — opens https://uat-pay.gurutvapay.com/payment?token=...
+- **Example files**:
+  - `checkout.html` — demo page for UAT & LIVE checkout
+  - `README.md` — this file
 
-gurutvapay-live.js — opens https://payment.gurutvapay.com/payment?token=...
+---
 
-Example HTML showing how to include the scripts and start checkout by passing the token.
+## Quick Summary (How It Works)
 
-Use this README to install, import, and wire the server (PHP SDK) → client (JS) flow end-to-end.
+1. **Server (PHP)** uses `gurutvapay_client.php` to:
+   - Authenticate (login or API key)
+   - Create a payment order
+   - Receive a `token` (e.g. `pay_8fc13996...`) and `payment_url`
 
-Contents
+2. **Client (Browser)** includes launcher scripts:
+   - `gurutvapay-uat.js` or `gurutvapay-live.js`
+   - Calls:
+     ```js
+     GurutvapayUat.launch(token);
+     // or
+     GurutvapayLive.launch(token);
+     ```
+   - Opens GurutvaPay checkout in a popup (or redirect fallback)
 
-gurutvapay_client.php — PHP SDK (single file)
+---
 
-checkout.html — example page demonstrating UAT & LIVE checkout launch
+## Requirements
 
-gurutvapay-uat.js / gurutvapay-live.js — launcher scripts (host them in /static/ or use provided CDN path)
+- PHP **7.4+** (works on PHP 8.x)
+- `curl` extension enabled
+- HTTPS (production only)
+- Store credentials in **environment variables** or a secrets manager
 
-README.md — this file
+---
 
-Quick summary (how it works)
+## Installation
 
-Server (PHP) uses gurutvapay_client.php to:
+1. Copy `gurutvapay_client.php` into your project (e.g. `lib/gurutvapay_client.php`)
+2. Host `gurutvapay-uat.js` and `gurutvapay-live.js` under `/public/js/`  
+   OR use CDN:
 
-login (password grant) or use API key,
-
-create a payment (order) via initiatePayment(...).
-
-Gateway returns a token (e.g. pay_8fc13996...) and payment_url.
-
-Server renders a page (or returns JSON) containing the token.
-
-Client (browser) includes gurutvapay-uat.js or gurutvapay-live.js and calls GurutvapayUat.launch(token) (or GurutvapayLive.launch(token)).
-
-The script opens the checkout page in a popup (fallback redirect).
-
-Requirements
-
-PHP 7.4+ (works on PHP 8.x)
-
-curl extension enabled
-
-HTTPS for production
-
-Keep credentials (client_secret/api_key/webhook secret) in environment variables or a secret manager
-
-Installation
-
-Copy gurutvapay_client.php into your project, e.g. lib/gurutvapay_client.php.
-
-Host gurutvapay-uat.js and gurutvapay-live.js under your public folder (e.g. /public/js/) or use your provided gateway static URLs:
-
+```html
 <script src="https://api.gurutvapay.com/static/gurutvapay-uat.js"></script>
 <script src="https://api.gurutvapay.com/static/gurutvapay-live.js"></script>
+```
 
-Configuration — environment variables (recommended)
 
-Store secrets in environment variables:
-
-# for UAT
+Configuration (Environment Variables)
+```
+# For UAT
 GURUTVA_ENV=uat
 GURUTVA_CLIENT_ID=CLIENT_12345
 GURUTVA_CLIENT_SECRET=SECRET_67890
@@ -76,19 +71,21 @@ GURUTVA_USERNAME=john@example.com
 GURUTVA_PASSWORD=your_password
 GURUTVA_WEBHOOK_SECRET=supersecret
 
-# for LIVE (use different values)
+# For LIVE
 GURUTVA_ENV=live
 GURUTVA_CLIENT_ID=LIVE_CLIENT_...
 GURUTVA_CLIENT_SECRET=LIVE_SECRET_...
 GURUTVA_USERNAME=...
 GURUTVA_PASSWORD=...
+```
 
-Using the PHP SDK: examples
-1) Basic flow (UAT) — login then initiate payment
-<?php
+Usage Examples
+1. Basic PHP Flow (UAT)
+
+
+```
 require_once __DIR__ . '/lib/gurutvapay_client.php';
 
-// Create SDK instance for UAT
 $uatConfig = [
     'client_id' => getenv('GURUTVA_CLIENT_ID'),
     'client_secret' => getenv('GURUTVA_CLIENT_SECRET'),
@@ -99,11 +96,9 @@ $uatConfig = [
 $sdk = new GurutvaPay('uat', $uatConfig);
 
 try {
-    // 1) Login to get access_token
     $loginResp = $sdk->login();
     $accessToken = $loginResp['access_token'];
 
-    // 2) Create payment order
     $order = [
         "amount" => 100,
         "merchantOrderId" => "ORD" . time(),
@@ -118,44 +113,22 @@ try {
 
     $initResp = $sdk->initiatePayment($order, $accessToken);
 
-    // The response should include 'token' and/or 'payment_url'
-    // Example:
-    // $initResp = [
-    //   "status" => "pending",
-    //   "grd_id" => "ORD123456",
-    //   "amount" => 100,
-    //   "token" => "pay_8fc1...",
-    //   "payment_url" => "https://uat-pay.gurutvapay.com/payment?token=pay_8fc1..."
-    // ];
-    $token = $initResp['token'] ?? null;
-    $paymentUrl = $initResp['payment_url'] ?? null;
-
-    // Render page or return JSON with token to client
-    // Example: echo JSON (for AJAX)
     header('Content-Type: application/json');
-    echo json_encode(['token' => $token, 'payment_url' => $paymentUrl, 'raw' => $initResp]);
-
+    echo json_encode([
+        'token' => $initResp['token'] ?? null,
+        'payment_url' => $initResp['payment_url'] ?? null,
+        'raw' => $initResp
+    ]);
 } catch (GurutvaPayException $e) {
-    // handle errors (log, return friendly message)
-    error_log("GurutvaPay error: " . $e->getMessage());
     http_response_code(500);
     echo json_encode(['error' => $e->getMessage()]);
 }
+```
 
-
-Note: For production you can skip login() and use an API key mode (if your gateway supports API key) rather than password grant.
-
-2) Serve a checkout page that embeds token (server-rendered)
-
-Example checkout.php:
-
+2. Checkout Page with Token
+```
 <?php
-require_once __DIR__ . '/lib/gurutvapay_client.php';
-
-// create order & get token (same as above)...
-// assume $token contains the token string
-
-// Render an HTML page that includes the launcher scripts and token
+// assume $token = created from initiatePayment()
 ?>
 <!doctype html>
 <html>
@@ -170,9 +143,8 @@ require_once __DIR__ . '/lib/gurutvapay_client.php';
   <button id="liveBtn">Pay (LIVE)</button>
 
   <script>
-    const tokenUat = "<?php echo htmlspecialchars($token, ENT_QUOTES, 'UTF-8'); ?>";
-    // If you have separate token for live, set tokenLive too
-    const tokenLive = ""; // set if available
+    const tokenUat = "<?php echo htmlspecialchars($token); ?>";
+    const tokenLive = ""; // optional
 
     document.getElementById('uatBtn').addEventListener('click', () => {
       GurutvapayUat.launch(tokenUat);
@@ -184,18 +156,15 @@ require_once __DIR__ . '/lib/gurutvapay_client.php';
   </script>
 </body>
 </html>
+```
 
-3) Safer flow — fetch token immediately before launch (recommended)
+3. Recommended Flow (Fetch Token on Click)
 
-Instead of embedding token in HTML, create a server endpoint that creates the session and returns { token: "pay_..." }. Call it from client with fetch() when user clicks Pay.
-
-Client-side:
-
+```
 <button id="payBtn">Pay</button>
 <script src="https://api.gurutvapay.com/static/gurutvapay-uat.js"></script>
 <script>
 document.getElementById('payBtn').addEventListener('click', async () => {
-  // call your server to create payment and return token (server uses SDK)
   const res = await fetch('/api/create-payment-session', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -205,142 +174,38 @@ document.getElementById('payBtn').addEventListener('click', async () => {
   if (data.token) {
     GurutvapayUat.launch(data.token);
   } else {
-    alert('Failed to create payment session');
+    alert('Failed to create session');
   }
 });
 </script>
+```
 
-
-Server endpoint /api/create-payment-session should run the login() + initiatePayment() flow and return token in JSON.
-
-Client-side Launcher scripts
-
-Place these under your public static folder or use gateway-hosted versions:
+Client-Side Launcher
 
 UAT: https://api.gurutvapay.com/static/gurutvapay-uat.js
 
 LIVE: https://api.gurutvapay.com/static/gurutvapay-live.js
 
-What they do: expose a global function:
+Exposes global functions:
 
-GurutvapayUat.launch(token, opts) — open UAT checkout
-
-GurutvapayLive.launch(token, opts) — open LIVE checkout
-
-opts can include width, height, and mode: 'popup' | 'redirect'. Example:
-
+```
 GurutvapayUat.launch('pay_abc123', { width: 1000, height: 800 });
-// or redirect
 GurutvapayLive.launch('pay_abc123', { mode: 'redirect' });
+```
 
-Example checkout.html (complete demo)
+Security Notes
 
-Save as checkout.html in your public directory and update script paths / token logic.
+Never expose API keys/client secrets in JS
 
-<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8">
-  <title>Gurutvapay Demo</title>
-  <script src="https://api.gurutvapay.com/static/gurutvapay-uat.js"></script>
-  <script src="https://api.gurutvapay.com/static/gurutvapay-live.js"></script>
-</head>
-<body>
-  <button id="uatBtn">Pay (UAT)</button>
-  <button id="liveBtn">Pay (LIVE)</button>
+Always issue tokens from server
 
-  <script>
-    // Example: fetch token from server endpoint (recommended)
-    document.getElementById('uatBtn').addEventListener('click', async () => {
-      const resp = await fetch('/api/create-payment-session', { method: 'POST' });
-      const json = await resp.json();
-      if (json.token) GurutvapayUat.launch(json.token);
-      else alert('Failed to create session');
-    });
+Use HTTPS
 
-    document.getElementById('liveBtn').addEventListener('click', async () => {
-      const resp = await fetch('/api/create-payment-session-live', { method: 'POST' });
-      const json = await resp.json();
-      if (json.token) GurutvapayLive.launch(json.token);
-      else alert('Failed to create session');
-    });
-  </script>
-</body>
-</html>
-
-Webhook verification (server)
-
-Always verify gateway webhooks on server using HMAC-SHA256 and your webhook secret.
-
-Example (PHP):
-
-$payload = file_get_contents('php://input');
-$sigHeader = $_SERVER['HTTP_X_SIGNATURE'] ?? $_SERVER['HTTP_X_GURUTVAPAY_SIGNATURE'] ?? null;
-$secret = getenv('GURUTVA_WEBHOOK_SECRET');
-
-if (!GurutvaPay::verifyWebhook($payload, $sigHeader, $secret)) {
-    http_response_code(401);
-    echo 'Invalid signature';
-    exit;
-}
-// process event JSON
-$data = json_decode($payload, true);
+Store secrets in env vars or secret managers
 
 
-If the verifyWebhook method is not present on your class, implement HMAC-SHA256 compare using hash_hmac('sha256', $payload, $secret) and hash_equals().
-
-Error handling & retries
-
-The included PHP SDK throws GurutvaPayException for any HTTP/cURL error. Catch it and return friendly messages to users.
-
-For idempotent initiatePayment calls, set an Idempotency-Key header (if the gateway supports it) in the httpPost helper — this prevents duplicate orders on retries.
-
-Security notes
-
-Never expose API keys or client secrets in client-side JS.
-
-Generate tokens on the server and keep them short-lived.
-
-Use HTTPS for all endpoints and scripts.
-
-Store secrets in environment variables or a secrets manager.
-
-Limit access to the endpoint that issues tokens (e.g., require authenticated merchants).
-
-Packaging & Composer (optional)
-
-To convert this into a Composer package:
-
-Move gurutvapay_client.php into src/ and add namespaces (PSR-4).
-
-Add composer.json:
-
-{
-  "name": "yourorg/gurutvapay-php",
-  "description": "Gurutvapay PHP SDK (single-file)",
-  "type": "library",
-  "autoload": {
-    "psr-4": { "Gurutvapay\\": "src/" }
-  },
-  "require": {
-    "php": ">=7.4"
-  }
-}
-
-
-composer install, test, and publish to Packagist if desired.
-
-Troubleshooting
-
-cURL error — ensure php-curl is installed and enabled.
-
-Invalid JSON response — gateway returned HTML or plain text; inspect raw response in logs.
-
-Popup blocked — launcher falls back to redirect; prefer user-initiated clicks (not automatic popups).
-
-Token not working — check that you used the correct env (uat vs live) and passed the token string returned by initiatePayment.
-
-Example repository layout
+Example Project Layout
+```
 /
 ├─ lib/
 │  └─ gurutvapay_client.php
@@ -352,3 +217,5 @@ Example repository layout
 ├─ api/
 │  └─ create-payment-session.php
 ├─ README.md
+```
+
